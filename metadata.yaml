@@ -2,7 +2,7 @@ name: astrbot_plugin_lolicon # 插件唯一识别名（英文包标识，市场�
 display_name: 我要涩涩增强版 # 插件显示名
 desc: 基于 Lolicon API 的可配置随机涩图插件，支持触发词匹配模式、数据源切换、本地缓存池。 # 插件描述
 help: 在 WebUI 插件配置中设置触发词与匹配模式；默认触发词为 色图/涩图/瑟图，匹配模式 contains。 # 帮助信息
-version: 2.1.2 # 版本号
+version: 2.2.0 # 版本号
 author: lolicin # 作者
 repo: https://github.com/lolicin/astrbot_plugin_lolicon # 仓库地址
 astrbot_version: ">=4.0.0" # 兼容的 AstrBot 版本

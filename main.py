@@ -556,7 +556,7 @@ def match_trigger(text: str, mode: str, words: list) -> bool:
     "astrbot_plugin_lolicon",
     "lolicin",
     "我要涩涩增强版",
-    "2.1",
+    "2.2",
     "https://github.com/lolicin/astrbot_plugin_lolicon"
 )
 class LoliconPlugin(Star):
