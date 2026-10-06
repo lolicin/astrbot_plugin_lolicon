@@ -580,6 +580,7 @@ class LoliconPlugin(Star):
             "rate_limited": "急什么，等一下再试",
             "fetch_timeout": "信号太差没找到涩涩",
             "tag_ignored": "太多了顾不上标签啦",
+            "tag_not_found": "没有找到这些标签的图，随机给你来点涩图吧",
         }
         plain = {
             "cache_empty": "库存为空，正在补货，请稍后再试",
@@ -591,6 +592,7 @@ class LoliconPlugin(Star):
             "rate_limited": "你太快啦，等一下再试",
             "fetch_timeout": "获取超时，请稍后再试",
             "tag_ignored": "多图已忽略标签，走本地缓存（更快）",
+            "tag_not_found": "没有找到与标签 {tags} 匹配的图片，已为你随机取图",
         }
         table = playful if style == "playful" else plain
         text = table.get(key, plain.get(key, ""))
@@ -667,6 +669,14 @@ class LoliconPlugin(Star):
                     tag_ignored = True
 
             images = await self.image_manager.acquire_images(num, resolved_tags)
+
+            # 标签搜不到图时回退随机图（走缓存池），并附加提示
+            tag_fallback = False
+            if not images and resolved_tags:
+                logger.info(f"tag search returned nothing for {resolved_tags}, falling back to random")
+                tag_fallback = True
+                images = await self.image_manager.acquire_images(num, [])
+
             if not images:
                 asyncio.create_task(self.image_manager.check_and_refill_cache())
                 return event.plain_result(self._msg("cache_empty"))
@@ -689,7 +699,9 @@ class LoliconPlugin(Star):
 
             if sent_count > 0:
                 asyncio.create_task(self.image_manager.check_and_refill_cache())
-                if tag_ignored:
+                if tag_fallback:
+                    text = f"{self._msg('tag_not_found', tags=', '.join(tags))} x{sent_count}"
+                elif tag_ignored:
                     text = self._msg("tag_ignored")
                 else:
                     text = f"{self._msg('sent')} x{sent_count}"
