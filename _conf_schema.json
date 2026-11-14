@@ -112,5 +112,47 @@
     "type": "int",
     "default": 300,
     "hint": "后台任务检查库存并补充的周期"
+  },
+  "default_count": {
+    "description": "默认发送张数",
+    "type": "int",
+    "default": 1,
+    "hint": "只说“涩图”而不带数量时发几张。设小一点响应更快，也不会一口气把库存抽干"
+  },
+  "cooldown_seconds": {
+    "description": "同一用户冷却时间（秒）",
+    "type": "int",
+    "default": 0,
+    "hint": "0=不限；范围内重复请求才会提示“你太快啦”。建议 3~10，别设大，设大了又变成动不动被拒"
+  },
+  "queue_wait_seconds": {
+    "description": "并发排队等待上限（秒）",
+    "type": "int",
+    "default": 45,
+    "hint": "上一个请求还没做完时，新请求先排队等，等超过这个秒数才提示太快。0=不排队直接拒"
+  },
+  "download_timeout_total": {
+    "description": "单图下载总超时（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "pixiv 原图常见 5MB 以上，45 秒在慢速网络必超时。日志出现 Save image failed 时优先调这里"
+  },
+  "download_timeout_read": {
+    "description": "下载读超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "单次读数据的空闲超时"
+  },
+  "download_timeout_connect": {
+    "description": "下载连接超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "建立连接的超时时间"
+  },
+  "keep_sent_images": {
+    "description": "发出去的图留在库存池",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后本次抓到的图会留在缓存里当库存，下次请求直接秒发；关闭则发完即删（更省空间但每次都要现下）"
   }
 }
