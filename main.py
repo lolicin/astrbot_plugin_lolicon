@@ -174,15 +174,39 @@ async def compress_image_async(data: bytes, max_bytes: int) -> bytes:
 # ==================== 速率限制 ====================
 
 class RateLimiter:
-    """按用户加锁防并发刷，带 TTL 防泄漏。"""
+    """按用户串行 + 冷却时间。
+
+    旧实现：拿不到锁就立刻回"你太快啦" —— 首图还没下载完（45s 超时）
+    用户再发一次就被拒，表现为"动不动就太快"。
+    现在：短消息直接排队等前一个做完（有上限），只有真在刷屏或冷却未过才拒。
+    """
+
     MAX_LOCKS = 1000
     LOCK_TTL = 120
 
-    def __init__(self):
+    def __init__(self, cooldown: float = 0.0, queue_wait: float = 45.0):
+        self.cooldown = cooldown
+        self.queue_wait = queue_wait
         self._locks: dict = {}
         self._lock_times: dict = {}
+        self._last_finish: dict = {}
+
+    def configure(self, cooldown: float, queue_wait: float):
+        self.cooldown = max(0.0, float(cooldown))
+        self.queue_wait = max(0.0, float(queue_wait))
+
+    def _cooldown_left(self, user_id: str) -> float:
+        if self.cooldown <= 0:
+            return 0.0
+        last = self._last_finish.get(user_id)
+        if last is None:
+            return 0.0
+        left = self.cooldown - (time.monotonic() - last)
+        return left if left > 0 else 0.0
 
     async def acquire(self, user_id: str) -> bool:
+        if self._cooldown_left(user_id) > 0:
+            return False
         lock = self._locks.setdefault(user_id, asyncio.Lock())
         if lock.locked():
             t = self._lock_times.get(user_id, 0)
@@ -192,20 +216,33 @@ class RateLimiter:
                 except RuntimeError:
                     pass
         if lock.locked():
-            return False
+            # 前一个请求还在跑：排队等，不当成刷屏
+            if self.queue_wait <= 0:
+                return False
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=self.queue_wait)
+            except asyncio.TimeoutError:
+                return False
+            self._lock_times[user_id] = time.monotonic()
+            return True
         await lock.acquire()
         self._lock_times[user_id] = time.monotonic()
         return True
 
     async def release(self, user_id: str):
+        self._last_finish[user_id] = time.monotonic()
         if user_id in self._locks:
-            self._locks[user_id].release()
+            lock = self._locks[user_id]
+            if lock.locked():
+                lock.release()
             self._lock_times.pop(user_id, None)
         if len(self._locks) > self.MAX_LOCKS:
             stale = [k for k, v in self._locks.items() if not v.locked()]
             for k in stale[: len(stale) // 2]:
                 del self._locks[k]
                 self._lock_times.pop(k, None)
+            if len(self._last_finish) > self.MAX_LOCKS:
+                self._last_finish.clear()
 
 
 _rate_limiter = RateLimiter()
@@ -220,6 +257,11 @@ class ImageManager:
         self.imgs_folder = str(data_path / "plugin_data" / "astrbot_plugin_lolicon" / "imgs")
         self.supported_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
         self.max_file_size = 20 * 1024 * 1024
+
+        # 下载超时（可配置）：pixiv 原图单张常有 5MB+，45s 总超时在慢线上必炸
+        self.download_timeout_total = int(config.get("download_timeout_total", 120))
+        self.download_timeout_connect = int(config.get("download_timeout_connect", 30))
+        self.download_timeout_read = int(config.get("download_timeout_read", 60))
 
         self._download_task = None
         self._refill_running = False
@@ -277,27 +319,53 @@ class ImageManager:
         except Exception:
             return False
 
+    async def _fetch_bytes(self, url):
+        """流式下载，带总超时抑制。返回图片字节或 None。
+
+        原实现 total=45s 且 aiohttp 默认 sock_read=5min，pixiv 源在慢速网络下
+        会触发 TimeoutError('') —— 异常消息为空，日志里只剩 "Save image failed: "。
+        """
+        timeout = aiohttp.ClientTimeout(
+            total=self.download_timeout_total,
+            connect=self.download_timeout_connect,
+            sock_read=self.download_timeout_read,
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.warning(f"Download HTTP {response.status}: {url}")
+                        return None
+                    content = await response.read()
+        except asyncio.TimeoutError:
+            logger.warning(f"Download timeout ({self.download_timeout_total}s): {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Download failed: {type(e).__name__}: {e!r} url={url}")
+            return None
+        if not content:
+            logger.warning(f"Download returned empty body: {url}")
+            return None
+        if len(content) > self.max_file_size:
+            logger.warning(f"Image too large ({len(content)} bytes): {url}")
+            return None
+        return content
+
     async def generate_and_save_image(self, url, filename):
         async with self.download_lock:
             try:
                 path = os.path.join(self.imgs_folder, filename)
                 if os.path.exists(path):
                     return filename
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=45)
-                ) as session:
-                    async with session.get(url) as response:
-                        if response.status != 200:
-                            return None
-                        content = await response.read()
-                        if not content or len(content) > self.max_file_size:
-                            return None
-                        async with aiofiles.open(path, "wb") as f:
-                            await f.write(content)
-                        logger.info(f"Saved image: {filename}")
-                        return filename
+                content = await self._fetch_bytes(url)
+                if not content:
+                    return None
+                async with aiofiles.open(path, "wb") as f:
+                    await f.write(content)
+                logger.info(f"Saved image: {filename} ({len(content)} bytes)")
+                return filename
             except Exception as e:
-                logger.error(f"Save image failed: {e}")
+                logger.error(f"Save image failed: {type(e).__name__}: {e!r}")
                 return None
 
     async def download_one(self):
@@ -332,7 +400,7 @@ class ImageManager:
         results = await fetch_setu_lolicon(
             r18=r18,
             num=num,
-            tags=[tags] if tags else [[], []],
+            tags=[[tags]] if tags else None,
             exclude_ai=self.config.get("exclude_ai", True),
             aspect_ratio=self.config.get("aspect_ratio", "gt1") or None,
         )
@@ -355,7 +423,7 @@ class ImageManager:
         results = await fetch_setu_lolicon(
             r18=r18,
             num=max(1, min(20, num)),
-            tags=[tags] if tags else [[], []],
+            tags=[[tags]] if tags else None,
             exclude_ai=self.config.get("exclude_ai", True),
             aspect_ratio=self.config.get("aspect_ratio", "gt1") or None,
         )
@@ -424,7 +492,7 @@ class ImageManager:
         return '.jpg'
 
     async def acquire_images(self, num: int, tags: list):
-        """获取图片路径：有标签走 lolicon 实时下载，无标签走缓存+补。"""
+        """获取图片路径：有标签走 lolicon 实时下载，无标签走缓存+批量补。"""
         if tags:
             return await self.download_with_tags(num, tags)
         images = []
@@ -433,11 +501,39 @@ class ImageManager:
         for f in cached[:num]:
             images.append(os.path.join(self.imgs_folder, f))
         need = num - len(images)
-        for _ in range(need):
-            filename = await self.download_one()
-            if filename:
-                images.append(os.path.join(self.imgs_folder, filename))
+        if need <= 0:
+            return images
+        # 缺图时一次性按 num 批量取（一次 API + 并行下载），不要一张张串行等
+        fetched = await self.fetch_and_save_batch(need)
+        images.extend(fetched[:need])
         return images
+
+    async def fetch_and_save_batch(self, num: int, tags=None):
+        """按数量批量抓取并保存，返回文件路径列表（顺序下载以防被源站限流）。"""
+        r18 = int(self.config.get("r18", 0))
+        if r18 == 2:
+            r18 = 1 if random.random() > 0.5 else 0
+        results = await fetch_setu_lolicon(
+            r18=r18,
+            num=max(1, min(20, num)),
+            tags=[[tags]] if tags else None,
+            exclude_ai=self.config.get("exclude_ai", True),
+            aspect_ratio=self.config.get("aspect_ratio", "gt1") or None,
+        )
+        if not results:
+            return []
+        paths = []
+        for item in results:
+            filename = f"{item['pid']}_p{item['p']}.{item['ext']}"
+            original_url = item["urls"].get("original")
+            if not original_url:
+                continue
+            saved = await self.generate_and_save_image(original_url, filename)
+            if saved:
+                paths.append(os.path.join(self.imgs_folder, saved))
+            if len(paths) >= num:
+                break
+        return paths
 
     async def compress_file(self, path: str, max_bytes: int):
         """读取文件、压缩、写回。"""
@@ -556,7 +652,7 @@ def match_trigger(text: str, mode: str, words: list) -> bool:
     "astrbot_plugin_lolicon",
     "lolicin",
     "我要涩涩增强版",
-    "2.2",
+    "2.1",
     "https://github.com/lolicin/astrbot_plugin_lolicon"
 )
 class LoliconPlugin(Star):
@@ -580,7 +676,6 @@ class LoliconPlugin(Star):
             "rate_limited": "急什么，等一下再试",
             "fetch_timeout": "信号太差没找到涩涩",
             "tag_ignored": "太多了顾不上标签啦",
-            "tag_not_found": "没有找到这些标签的图，随机给你来点涩图吧",
         }
         plain = {
             "cache_empty": "库存为空，正在补货，请稍后再试",
@@ -592,7 +687,6 @@ class LoliconPlugin(Star):
             "rate_limited": "你太快啦，等一下再试",
             "fetch_timeout": "获取超时，请稍后再试",
             "tag_ignored": "多图已忽略标签，走本地缓存（更快）",
-            "tag_not_found": "没有找到与标签 {tags} 匹配的图片，已为你随机取图",
         }
         table = playful if style == "playful" else plain
         text = table.get(key, plain.get(key, ""))
@@ -640,10 +734,19 @@ class LoliconPlugin(Star):
         except Exception:
             pass
 
+        try:
+            _rate_limiter.configure(
+                float(self.config.get("cooldown_seconds", 0) or 0),
+                float(self.config.get("queue_wait_seconds", 45) or 0),
+            )
+        except Exception:
+            pass
+
         if not await _rate_limiter.acquire(user_id):
             return event.plain_result(self._msg("rate_limited"))
 
         sent_basenames = []
+        _pool_names = set()
         result = None
         try:
             max_count = int(self.config.get("max_count", 5))
@@ -652,6 +755,9 @@ class LoliconPlugin(Star):
                 num = 1
                 if count_str:
                     tags = tags + [count_str]
+            if not count_str and not tags:
+                # 没指定数量时用默认张数，别一口气拉满
+                num = int(self.config.get("default_count", 1) or 1)
             if num < 1:
                 return event.plain_result(self._msg("invalid_count", max_count=max_count))
             if num > max_count:
@@ -669,17 +775,23 @@ class LoliconPlugin(Star):
                     tag_ignored = True
 
             images = await self.image_manager.acquire_images(num, resolved_tags)
-
-            # 标签搜不到图时回退随机图（走缓存池），并附加提示
-            tag_fallback = False
-            if not images and resolved_tags:
-                logger.info(f"tag search returned nothing for {resolved_tags}, falling back to random")
-                tag_fallback = True
-                images = await self.image_manager.acquire_images(num, [])
-
             if not images:
                 asyncio.create_task(self.image_manager.check_and_refill_cache())
                 return event.plain_result(self._msg("cache_empty"))
+
+            # 标出哪些是库存池里的老图（发完不删，留给库存），哪些是本次现抓的（发完删）
+            try:
+                already = set(await self.image_manager.get_image_list())
+            except Exception:
+                already = set()
+            to_download = set()
+            for p in images:
+                bn = os.path.basename(p)
+                if bn not in already:
+                    to_download.add(bn)
+            if self.config.get("keep_sent_images", True):
+                # 本次抓的也留在池里当库存，只删超量的
+                _pool_names = to_download
 
             max_bytes = int(self.config.get("max_image_bytes", 0))
             sent_count = 0
@@ -699,9 +811,7 @@ class LoliconPlugin(Star):
 
             if sent_count > 0:
                 asyncio.create_task(self.image_manager.check_and_refill_cache())
-                if tag_fallback:
-                    text = f"{self._msg('tag_not_found', tags=', '.join(tags))} x{sent_count}"
-                elif tag_ignored:
+                if tag_ignored:
                     text = self._msg("tag_ignored")
                 else:
                     text = f"{self._msg('sent')} x{sent_count}"
@@ -715,7 +825,12 @@ class LoliconPlugin(Star):
             result = event.plain_result(self._msg("error"))
         finally:
             await _rate_limiter.release(user_id)
+            # 只清理本次为「直接发出去」而抓来的图；库存池补进的新图要留着。
+            # 之前把本次拉到的图全删了，后台刚补满的缓存瞬间归零，
+            # 于是每次都走现场下载 → 慢 → 用户重发 → "你太快啦"。
             for bn in sent_basenames:
+                if bn in _pool_names:
+                    continue
                 await self.image_manager.delete_image(bn)
 
         if result:
